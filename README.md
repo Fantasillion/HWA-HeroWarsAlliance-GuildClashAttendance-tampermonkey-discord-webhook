@@ -11,4 +11,3 @@
 5. Send English to Discord/Send Russian to Discord/Manually copy and paste where ever you want
 
 <img width="359" height="415" alt="image" src="https://github.com/user-attachments/assets/7cf3cddc-ec2d-44ad-9671-50f314403646" />
-" />
