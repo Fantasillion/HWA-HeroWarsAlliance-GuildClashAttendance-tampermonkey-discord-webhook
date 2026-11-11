@@ -1,0 +1,609 @@
+// ==UserScript==
+// @name         Hero Wars Alliance - Guild Clash Attendance
+// @namespace    fantasillion.hwa
+// @version      1.1.0
+// @description  English/Russian Guild Clash registration reports with Discord posting.
+// @match        https://www.hero-wars-alliance.com/*
+// @match        https://hero-wars-alliance.com/*
+// @run-at       document-start
+// @grant        unsafeWindow
+// @grant        GM_setClipboard
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      discord.com
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const page = unsafeWindow;
+    const KEY = '__hwaClashAttendanceV11';
+
+    if (page[KEY]) return;
+    page[KEY] = true;
+
+    let roster = null;
+    let clash = null;
+    let output;
+    let status;
+    let copyButton;
+    let sendButton;
+    let sending = false;
+
+    let webhook = GM_getValue('guildClashWebhook', '');
+
+    function isRpc(url) {
+        try {
+            const u = new URL(String(url), location.href);
+            return (
+                u.hostname === 'api.hero-wars-alliance.com' &&
+                u.pathname === '/api/rpc'
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function ingest(data) {
+        if (!Array.isArray(data?.results)) return;
+
+        for (const item of data.results) {
+            if (item.error || item.result?.error) continue;
+
+            const response = item.result?.response;
+            if (!response || typeof response !== 'object') continue;
+
+            const clan = response.clanData?.clan;
+
+            if (clan) {
+                const previousGuild = roster?.id;
+                roster = null;
+
+                if (clan.members && clan.id != null) {
+                    const members = Object.values(clan.members).map(m => ({
+                        id: m.id == null ? '' : String(m.id),
+                        name: m.name
+                    }));
+
+                    const valid =
+                        members.length > 0 &&
+                        members.length === Number(clan.membersCount) &&
+                        members.every(m =>
+                            m.id && typeof m.name === 'string'
+                        ) &&
+                        new Set(members.map(m => m.id)).size ===
+                            members.length;
+
+                    if (valid) {
+                        roster = {
+                            id: String(clan.id),
+                            title: clan.title || 'Guild',
+                            server: String(clan.serverId || '?'),
+                            members
+                        };
+
+                        if (
+                            previousGuild &&
+                            previousGuild !== roster.id
+                        ) {
+                            clash = null;
+                        }
+                    }
+                }
+            }
+
+            if (Object.prototype.hasOwnProperty.call(response, 'clashEvent')) {
+                clash = null;
+
+                const event = response.clashEvent;
+
+                // Verified preparation-phase response format.
+                const valid =
+                    event &&
+                    event.currentState?.type === 2 &&
+                    Array.isArray(event.lanes) &&
+                    event.lanes.length > 0 &&
+                    event.lanes.every(lane =>
+                        Array.isArray(lane.players)
+                    ) &&
+                    Array.isArray(event.players) &&
+                    event.players.length === 0 &&
+                    Array.isArray(event.clans) &&
+                    event.clans.length === 0;
+
+                if (valid) {
+                    const players = event.lanes
+                        .flatMap(lane => lane.players)
+                        .map(player => player.info);
+
+                    if (players.every(player => player?.id != null)) {
+                        clash = {
+                            ids: new Set(
+                                players.map(player => String(player.id))
+                            ),
+                            event: event.id,
+                            cycle: event.cycleId,
+                            end: Number(event.currentState.endTime)
+                        };
+                    }
+                }
+            }
+        }
+
+        render();
+    }
+
+    function readiness() {
+        if (!roster) {
+            return 'Waiting for the complete guild roster.\n' +
+                'Open your guild member list.';
+        }
+
+        if (!clash) {
+            return 'Waiting for Guild Clash preparation data.\n' +
+                'Open Guild Clash. Other phases are not yet supported.';
+        }
+
+        if (
+            !Number.isFinite(clash.end) ||
+            Date.now() >= clash.end * 1000
+        ) {
+            return 'The captured phase has ended.\n' +
+                'Reload the game to obtain current data.';
+        }
+
+        const ids = new Set(roster.members.map(m => m.id));
+
+        if ([...clash.ids].some(id => !ids.has(id))) {
+            return 'Guild roster and participants do not match.\n' +
+                'Reload, then open guild members and Guild Clash.';
+        }
+
+        return '';
+    }
+
+    function clean(value) {
+        return String(value)
+            .replace(/[\r\n\t]/g, ' ')
+            .replace(/`/g, 'ˋ');
+    }
+
+    function frame(lines) {
+        return [
+            '╔══════════════════════════════════╗',
+            ...lines.map(line => {
+                if (line === '=') {
+                    return '╠══════════════════════════════════╣';
+                }
+                if (line === '-') {
+                    return '╟──────────────────────────────────╢';
+                }
+                return '║ ' + line;
+            }),
+            '╚══════════════════════════════════╝'
+        ].join('\n');
+    }
+
+     function reports() {
+    const members = [...roster.members].sort(
+        (a, b) => a.name.localeCompare(b.name)
+    );
+
+    const missing = members.filter(
+        member => !clash.ids.has(member.id)
+    );
+
+    const registered = members.filter(
+        member => clash.ids.has(member.id)
+    );
+
+    const guild = clean(roster.title);
+    const total = members.length;
+
+    const english = [
+        '📋 GUILD CLASH • ROLL CALL',
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+        guild,
+        `Server ${roster.server} • Event ${clash.event} • Cycle ${clash.cycle}`,
+        '',
+        `✅ Registered: ${registered.length}/${total}`,
+        `❌ Not registered: ${missing.length}`,
+        '',
+        '🔴 NOT REGISTERED',
+        '────────────────────────────',
+        ...(missing.length
+            ? missing.map(member => '🔴 ' + clean(member.name))
+            : ['Nobody missing!']),
+        '',
+        ...(missing.length
+            ? ['📢 Please remember to register!']
+            : ['🎉 Everyone has signed up!']),
+        '',
+        '🟢 REGISTERED',
+        '────────────────────────────',
+        ...(registered.length
+            ? registered.map(member => '🟢 ' + clean(member.name))
+            : ['No registrations yet.']),
+        '',
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+        '📋 Registration attendance • Guild Clash'
+    ].join('\n');
+
+    const russian = [
+        '📋 БИТВА ГИЛЬДИЙ • ПЕРЕКЛИЧКА',
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+        guild,
+        `Сервер ${roster.server} • Событие ${clash.event} • Цикл ${clash.cycle}`,
+        '',
+        `✅ Зарегистрировано: ${registered.length}/${total}`,
+        `❌ Не зарегистрировано: ${missing.length}`,
+        '',
+        '🔴 НЕ ЗАРЕГИСТРИРОВАЛИСЬ',
+        '────────────────────────────',
+        ...(missing.length
+            ? missing.map(member => '🔴 ' + clean(member.name))
+            : ['Отсутствующих нет!']),
+        '',
+        ...(missing.length
+            ? ['📢 Не забудьте зарегистрироваться!']
+            : ['🎉 Все зарегистрировались!']),
+        '',
+        '🟢 ЗАРЕГИСТРИРОВАЛИСЬ',
+        '────────────────────────────',
+        ...(registered.length
+            ? registered.map(member => '🟢 ' + clean(member.name))
+            : ['Пока никто не зарегистрировался.']),
+        '',
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+        '📋 Учёт регистрации • Битва гильдий'
+    ].join('\n');
+
+    return [
+        {
+            title: '📋 Guild Clash — Registration Roll Call',
+            body: english,
+            footer: `Guild Clash Attendance | ${guild}`
+        },
+        {
+            title: '📋 Битва гильдий — Перекличка',
+            body: russian,
+            footer: `Guild Clash Attendance | ${guild}`
+        }
+    ];
+}
+
+    function formatted(report) {
+        return `**${report.title}**\n` +
+            '```text\n' + report.body + '\n```\n' +
+            `**${report.footer}**`;
+    }
+
+    function render() {
+        if (!output) return;
+
+        const problem = readiness();
+
+        output.value = problem ||
+            reports().map(formatted).join('\n\n');
+
+        copyButton.disabled = Boolean(problem);
+        sendButton.disabled = Boolean(problem) || sending;
+    }
+
+    function validWebhook(value) {
+        try {
+            const url = new URL(value);
+
+            return (
+                url.protocol === 'https:' &&
+                url.hostname === 'discord.com' &&
+                /^\/api\/webhooks\/\d+\/[A-Za-z0-9._-]+\/?$/
+                    .test(url.pathname) &&
+                !url.username &&
+                !url.password
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function configureWebhook() {
+        const entered = prompt(
+            'Paste your Discord webhook URL.\n' +
+            'Leave empty to remove the saved URL.',
+            webhook
+        );
+
+        if (entered === null) return;
+
+        const value = entered.trim();
+
+        if (value && !validWebhook(value)) {
+            status.textContent =
+                'Invalid URL. Expected https://discord.com/api/webhooks/…';
+            return;
+        }
+
+        webhook = value;
+        GM_setValue('guildClashWebhook', webhook);
+
+        status.textContent = webhook
+            ? 'Webhook URL saved.'
+            : 'Saved webhook removed.';
+    }
+
+    // Split long reports into separate valid Discord messages.
+    function discordMessages(report) {
+        const chunks = [];
+        let lines = [];
+        let length = 0;
+
+        for (const line of report.body.split('\n')) {
+            if (length + line.length + 1 > 1500 && lines.length) {
+                chunks.push(lines.join('\n'));
+                lines = [];
+                length = 0;
+            }
+
+            lines.push(line);
+            length += line.length + 1;
+        }
+
+        if (lines.length) chunks.push(lines.join('\n'));
+
+        return chunks.map((body, index) => {
+            const part = chunks.length > 1
+                ? ` (${index + 1}/${chunks.length})`
+                : '';
+
+            return formatted({
+                title: report.title + part,
+                body,
+                footer: report.footer
+            });
+        });
+    }
+
+    function postDiscord(content) {
+        return new Promise((resolve, reject) => {
+            const url = new URL(webhook);
+            url.searchParams.set('wait', 'true');
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: url.href,
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                data: JSON.stringify({
+                    content,
+                    allowed_mentions: { parse: [] }
+                }),
+                timeout: 20000,
+                onload(response) {
+                    if (
+                        response.status >= 200 &&
+                        response.status < 300
+                    ) {
+                        resolve();
+                    } else {
+                        reject(new Error(
+                            `Discord returned HTTP ${response.status}.`
+                        ));
+                    }
+                },
+                onerror() {
+                    reject(new Error('Could not connect to Discord.'));
+                },
+                ontimeout() {
+                    reject(new Error(
+                        'Request timed out. Check Discord before retrying.'
+                    ));
+                }
+            });
+        });
+    }
+
+    async function sendDiscord() {
+        if (sending) return;
+
+        render();
+        if (readiness()) return;
+
+        if (!webhook) {
+            configureWebhook();
+            if (!webhook) return;
+        }
+
+        if (!validWebhook(webhook)) {
+            status.textContent = 'Enter a valid webhook URL first.';
+            return;
+        }
+
+        const messages = reports().flatMap(discordMessages);
+
+        if (messages.some(message => message.length > 2000)) {
+            status.textContent =
+                'Report contains an unusually long name. Copy it manually.';
+            return;
+        }
+
+        sending = true;
+        render();
+
+        let sent = 0;
+
+        try {
+            for (const message of messages) {
+                status.textContent =
+                    `Sending ${sent + 1}/${messages.length}…`;
+
+                await postDiscord(message);
+                sent++;
+            }
+
+            status.textContent =
+                'English and Russian reports sent to Discord.';
+        } catch (error) {
+            status.textContent =
+                `${sent}/${messages.length} messages confirmed sent. ` +
+                error.message;
+        } finally {
+            sending = false;
+            render();
+        }
+    }
+
+    // Read normal RPC responses. No extra game requests are sent.
+    const originalFetch = page.fetch;
+
+    page.fetch = function (...args) {
+        let observe = false;
+
+        try {
+            const input = args[0];
+            observe = isRpc(input?.url || input);
+        } catch {
+            // Never block the game.
+        }
+
+        const promise = Reflect.apply(originalFetch, this, args);
+
+        if (observe) {
+            promise.then(response => {
+                if (response.ok) {
+                    response.clone().json()
+                        .then(ingest)
+                        .catch(() => {});
+                }
+            }).catch(() => {});
+        }
+
+        return promise;
+    };
+
+    const metadata = new WeakMap();
+    const xhr = page.XMLHttpRequest.prototype;
+    const originalOpen = xhr.open;
+    const originalSend = xhr.send;
+
+    xhr.open = function (method, url, ...rest) {
+        metadata.set(this, isRpc(url));
+
+        return Reflect.apply(
+            originalOpen,
+            this,
+            [method, url, ...rest]
+        );
+    };
+
+    xhr.send = function (...args) {
+        if (metadata.get(this)) {
+            this.addEventListener('load', () => {
+                try {
+                    if (this.status < 200 || this.status >= 300) return;
+
+                    const data = this.responseType === 'json'
+                        ? this.response
+                        : JSON.parse(this.responseText);
+
+                    ingest(data);
+                } catch {
+                    // Ignore unsupported or non-JSON responses.
+                }
+            }, { once: true });
+        }
+
+        return Reflect.apply(originalSend, this, args);
+    };
+
+    function mount() {
+        const panel = document.createElement('details');
+        panel.open = true;
+
+        panel.style.cssText = [
+            'position:fixed',
+            'right:12px',
+            'top:12px',
+            'z-index:2147483647',
+            'background:#172130',
+            'color:#fff',
+            'padding:12px',
+            'border:1px solid #789',
+            'border-radius:8px',
+            'width:370px',
+            'max-width:calc(100vw - 48px)',
+            'font:14px Arial',
+            'box-shadow:0 4px 18px #0008'
+        ].join(';');
+
+        const title = document.createElement('summary');
+        title.textContent = '⚔️ Guild Clash Attendance';
+        title.style.cursor = 'pointer';
+
+        output = document.createElement('textarea');
+        output.readOnly = true;
+
+        output.style.cssText = [
+            'box-sizing:border-box',
+            'width:100%',
+            'height:350px',
+            'max-height:55vh',
+            'margin:10px 0',
+            'color:#fff',
+            'background:#101722',
+            'border:1px solid #567',
+            'padding:8px',
+            'resize:vertical',
+            'white-space:pre',
+            'font:12px monospace'
+        ].join(';');
+
+        const buttons = document.createElement('div');
+        buttons.style.cssText =
+            'display:flex;gap:6px;flex-wrap:wrap';
+
+        function button(text, action) {
+            const element = document.createElement('button');
+            element.textContent = text;
+            element.onclick = action;
+            element.style.cssText =
+                'padding:7px 9px;cursor:pointer;border-radius:4px;' +
+                'border:1px solid #789';
+            buttons.append(element);
+            return element;
+        }
+
+        copyButton = button('📋 Copy report', () => {
+            render();
+            if (readiness()) return;
+
+            GM_setClipboard(output.value, 'text');
+            status.textContent = 'English and Russian reports copied.';
+        });
+
+        button('🔗 Webhook URL', configureWebhook);
+        sendButton = button('📨 Send to Discord', sendDiscord);
+
+        status = document.createElement('div');
+        status.style.cssText =
+            'font-size:12px;color:#bcc9d9;margin-top:10px';
+
+        status.textContent =
+            'Open guild members and Guild Clash. ' +
+            'Click the heading to collapse.';
+
+        panel.append(title, output, buttons, status);
+        document.body.append(panel);
+        render();
+    }
+
+    if (document.body) {
+        mount();
+    } else {
+        document.addEventListener('DOMContentLoaded', mount, {
+            once: true
+        });
+    }
+})();
