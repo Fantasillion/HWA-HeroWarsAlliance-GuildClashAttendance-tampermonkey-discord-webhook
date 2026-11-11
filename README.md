@@ -1,0 +1,1 @@
+# HWA-HeroWarsAlliance-GuildClashAttendance-tampermonkey-discord-webhook
