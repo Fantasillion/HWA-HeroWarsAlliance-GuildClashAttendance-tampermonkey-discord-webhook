@@ -3,3 +3,11 @@
 
 
 # HWA-HeroWarsAlliance-GuildClashAttendance-tampermonkey-discord-webhook
+
+1. Install TamperMonkey in your preferred browser https://www.tampermonkey.net/
+2. Copy the contents of "TamperMonkey script" in to a new script in TamperMonkey.
+3. If you use Discord, copy the webhook url from the Discord channel you want to post data in and paste in the script window
+4. Load/Reload Hero Wars Alliance in browser.
+5. Send English to Discord/Send Russian to Discord/Manually copy and paste where ever you want
+
+<img width="359" height="415" alt="image" src="https://github.com/user-attachments/assets/dd90531c-2fee-4c03-9d99-bf3356f40ee4" />
